@@ -298,3 +298,100 @@ def test_estimate_preview_preserves_manual_targets_until_accepted(client):
     assert accepted.json()["accepted"] is True
     assert accepted.json()["profile"]["calorie_target"] != 2200
     assert accepted.json()["profile"]["targets_customized"] is False
+
+
+def test_automation_preferences_and_idempotent_daily_events(client):
+    register(client, "automation_user")
+    defaults = client.get("/api/automations/settings")
+    assert defaults.status_code == 200
+    assert defaults.json()["timezone_name"] == "Asia/Kolkata"
+    saved = write(client, "put", "/api/automations/settings", json={
+        "timezone_name": "Asia/Kolkata",
+        "water_reminders_enabled": False,
+        "water_interval_minutes": 90,
+        "morning_briefing_enabled": True,
+        "morning_briefing_time": "00:00",
+        "evening_checkin_enabled": True,
+        "evening_checkin_time": "00:00",
+    })
+    assert saved.status_code == 200
+    first = write(client, "post", "/api/automations/run-now", json={})
+    second = write(client, "post", "/api/automations/run-now", json={})
+    assert first.status_code == 200 and second.status_code == 200
+    assert first.json()["created_events"] >= 2
+    assert second.json()["created_events"] == 0
+    overview = client.get("/api/automations/overview")
+    assert overview.status_code == 200
+    kinds = {item["kind"] for item in overview.json()["events"]}
+    assert "briefing" in kinds and "checkin" in kinds
+
+
+def test_automation_events_are_user_scoped(client):
+    register(client, "automation_first")
+    write(client, "put", "/api/automations/settings", json={
+        "timezone_name": "Asia/Kolkata", "water_reminders_enabled": False,
+        "water_interval_minutes": 90, "morning_briefing_enabled": True,
+        "morning_briefing_time": "00:00", "evening_checkin_enabled": False,
+        "evening_checkin_time": "21:00",
+    })
+    write(client, "post", "/api/automations/run-now", json={})
+    assert len(client.get("/api/automations/overview").json()["events"]) >= 1
+    write(client, "post", "/api/auth/logout")
+    register(client, "automation_second")
+    assert client.get("/api/automations/overview").json()["events"] == []
+
+
+def test_new_load_personal_record_creates_automation_event(client):
+    register(client, "pr_user")
+    start = write(client, "post", "/api/workouts/start", json={"name": "Strength day"})
+    assert start.status_code == 201
+    session_id = start.json()["id"]
+    first = write(client, "post", f"/api/workouts/{session_id}/sets", json={
+        "exercise": "Bench Press", "set_number": 1, "weight_kg": 20, "reps": 8, "completed": True,
+    })
+    assert first.status_code == 201
+    second = write(client, "post", f"/api/workouts/{session_id}/sets", json={
+        "exercise": "bench press", "set_number": 2, "weight_kg": 25, "reps": 6, "completed": True,
+    })
+    assert second.status_code == 201
+    events = client.get("/api/automations/overview").json()["events"]
+    assert any(item["kind"] == "personal_record" and "25 kg" in item["message"] for item in events)
+
+
+def test_achievement_is_awarded_from_persisted_records(client):
+    register(client, "achievement_user")
+    write(client, "post", "/api/nutrition", json={
+        "food_name": "Banana", "quantity": 1, "serving_unit": "medium",
+        "calories": 105, "protein_g": 1.3, "carbs_g": 27, "fat_g": 0.4,
+        "meal": "Breakfast", "consumed_at": f"{date.today().isoformat()}T08:00:00",
+    })
+    result = write(client, "post", "/api/automations/run-now", json={})
+    assert result.status_code == 200
+    overview = client.get("/api/automations/overview").json()
+    assert any(item["code"] == "first_meal" for item in overview["achievements"])
+
+
+def test_hydration_events_are_persisted_and_deduplicated(client):
+    from app.main import AutomationEvent, SessionLocal, run_automations_for_user
+
+    register(client, "hydration_user")
+    write(client, "put", "/api/automations/settings", json={
+        "timezone_name": "UTC", "water_reminders_enabled": True,
+        "water_interval_minutes": 30, "morning_briefing_enabled": False,
+        "morning_briefing_time": "07:00", "evening_checkin_enabled": False,
+        "evening_checkin_time": "21:00",
+    })
+    # Use the test DB through the dependency override, not the process-global engine.
+    from app.main import get_db
+    override = app.dependency_overrides[get_db]
+    db = next(override())
+    try:
+        fixed_now = datetime(2026, 10, 25, 12, 0, tzinfo=ZoneInfo("UTC"))
+        first = run_automations_for_user(1, db, fixed_now)
+        second = run_automations_for_user(1, db, fixed_now)
+        assert first["created_events"] == 1
+        assert second["created_events"] == 0
+        rows = list(db.query(AutomationEvent).filter(AutomationEvent.user_id == 1).all())
+        assert len(rows) == 1 and rows[0].kind == "hydration"
+    finally:
+        db.close()

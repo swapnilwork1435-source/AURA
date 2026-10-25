@@ -82,14 +82,19 @@ npm.cmd run build
 - Water logging, history, edit/delete, and sleep logging, including sleep sessions crossing midnight.
 - Selectable completed-week reports for logged nutrition averages, workouts, weight, sleep, habits, and water. Missing logs are shown as missing rather than treated as zero.
 - CSV export of recorded body measurements and matching daily nutrition summaries.
+- Automation center with configurable hydration intervals, morning briefings, evening check-ins, suggestions based on saved records, a persistent event inbox, and read/unread state.
+- Idempotent automation events to avoid duplicate scheduled briefings and hydration reminders; IANA time-zone support and existing quiet-hour preferences.
+- Personal load-record detection for exercises when a logged set exceeds the previous recorded best.
+- Persistent achievements for first meal, first completed workout, first body measurement, hydration goal reached, and a seven-day all-habits streak.
+- A local background worker that evaluates schedules every 60 seconds while the machine is awake, plus a SQLite backup/restore utility with integrity checks and a pre-restore safety backup.
 - Responsive dark-first navigation and dashboard, including honest empty states.
 
 ## Known limitations
 
 - Nutrition and calorie values are estimates, not medical advice or measured metabolism. Initial estimates use Mifflin–St Jeor with approximate activity factors (1.20, 1.375, 1.55, 1.725, 1.90), configurable modest goal adjustments (+200 kcal surplus or −300 kcal deficit by default), protein assumptions (1.4 or 1.8 g/kg), and fat at about 25% of target energy; carbohydrates fill the remainder using 4/4/9 kcal-per-gram conversions. Rounding, fiber, and food-database variation mean macros may not exactly match calorie values. Estimates are skipped for minors, adults over 80, incomplete inputs, unsupported sex selections, low unsafe targets, or when the user opts out. Targets are never automatically changed in response to weight changes.
-- Meal and browser reminders are checked every 30 seconds only while the site is open and the API is reachable. Browser notifications require browser permission. There is no background or operating-system scheduler; reminders cannot be relied on while the browser is closed or the computer is sleeping, switched off, or offline. IANA time zones and daylight-saving transitions are used for scheduled reminder checks.
+- Existing meal reminders are polled by the frontend while the site is open. The new automation worker can create and persist hydration reminders, briefings, check-ins, achievements, and event records while the browser is closed, as long as the API/database and worker are running and the computer is awake. It does not currently deliver native push notifications to a closed browser; saved events are visible when the user opens AURA again. No local worker can run while the computer is asleep, powered off, or offline.
 - Food parsing recognizes only a small, explicit vocabulary from the local catalogue and supported serving units; unsupported descriptions require manual logging. Values in the seeded catalogue are estimates.
-- Adaptive multi-week weight-rate coaching, automated workout scheduling/progression and personal-record analytics, hydration reminders, ingredient/allergy/budget-aware meal suggestions, achievements/gamification, and a broad exercise catalogue are not implemented. Existing weight charts, workout history, hydration records, and weekly reports remain available.
+- The automation center's suggestions are deterministic and conservative, not a medical or AI coaching system. Weight trends are available in analytics, but automatic calorie-target changes remain intentionally disabled. Exercise personal records currently track a higher logged load for the same exercise name; full rep-max/e1RM analysis, workout periodization, and adaptive multi-week weight-rate coaching remain future work.
 - Full routines/wardrobe management, avatar customization, private progress-photo uploads, saved meals/recipes, and account password-reset email delivery are not implemented yet. Password recovery requires a future local account-administration workflow or an email service.
 - Values are stored and displayed in metric units (kg/cm/ml). Imperial display and conversion are deferred; only metric measurements are available in this version.
 - CSV export currently includes body measurement dates and nutrition totals for those dates; it is not a complete archive of every module.
@@ -97,9 +102,33 @@ npm.cmd run build
 - SQLite and uploaded data (none are enabled yet) are stored locally. Anyone with access to your Windows account or database backups can access those files. Protect the device and store backups securely. Account deletion is permanent.
 - The app is intended for a trusted, single-device local environment. Review deployment, HTTPS, secrets, backups, migrations, and operational security before exposing it to other devices or the public internet.
 
+## Automation worker
+
+For scheduled automations while the browser is closed, start a third PowerShell terminal from the AURA project directory after the API is running:
+
+```powershell
+Set-Location backend
+python -m app.automation_worker
+```
+
+The worker polls every 60 seconds and writes idempotent events to the local database. Keep this terminal running and the computer awake. Use **Automation → Run checks now** to evaluate events immediately. The worker does not yet send Web Push/OS notifications to a closed browser.
+
 ## Data backup and reset
 
-Stop the backend before copying the database. Back up `backend\data\aura.db` to a private location; database backups contain account hashes and personal wellness records.
+Stop the backend and automation worker before restoring a database. Create a consistent, integrity-checked SQLite backup with:
+
+```powershell
+Set-Location backend
+python backup_database.py
+```
+
+To restore, stop the backend and worker, then pass a trusted backup path. A pre-restore safety copy is created automatically:
+
+```powershell
+python backup_database.py --restore "C:\path\to\aura-backup.db"
+```
+
+Backups contain account hashes and personal wellness records. Store them privately and do not commit them to Git.
 
 To reset all local records, stop the backend and remove only `backend\data\aura.db`. Restarting the API recreates a clean database and the estimated food catalogue. This is destructive and cannot be undone.
 
