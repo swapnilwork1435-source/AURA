@@ -175,6 +175,46 @@ class ReminderDelivery(Base):
     __table_args__ = (UniqueConstraint("user_id", "meal", "local_date"),)
 
 
+
+
+class AutomationPreference(Base):
+    __tablename__ = "automation_preferences"
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), primary_key=True)
+    timezone_name: Mapped[str] = mapped_column(String(80), default="Asia/Kolkata")
+    water_reminders_enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    water_interval_minutes: Mapped[int] = mapped_column(Integer, default=90)
+    morning_briefing_enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    morning_briefing_time: Mapped[str] = mapped_column(String(5), default="07:00")
+    evening_checkin_enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    evening_checkin_time: Mapped[str] = mapped_column(String(5), default="21:00")
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now, onupdate=utc_now)
+
+
+class AutomationEvent(Base):
+    __tablename__ = "automation_events"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    event_key: Mapped[str] = mapped_column(String(180))
+    kind: Mapped[str] = mapped_column(String(40), index=True)
+    title: Mapped[str] = mapped_column(String(120))
+    message: Mapped[str] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now, index=True)
+    read_at: Mapped[datetime | None] = mapped_column(DateTime)
+    metadata_json: Mapped[str] = mapped_column(Text, default="{}")
+    __table_args__ = (UniqueConstraint("user_id", "event_key"),)
+
+
+class Achievement(Base):
+    __tablename__ = "achievements"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    code: Mapped[str] = mapped_column(String(60))
+    title: Mapped[str] = mapped_column(String(120))
+    description: Mapped[str] = mapped_column(Text)
+    earned_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now)
+    __table_args__ = (UniqueConstraint("user_id", "code"),)
+
+
 class WorkoutPlan(Base):
     __tablename__ = "workout_plans"
     id: Mapped[int] = mapped_column(primary_key=True)
@@ -342,6 +382,18 @@ class ReminderPreferencesInput(BaseModel):
     quiet_end: str | None = Field(default=None, pattern=r"^(?:[01]\d|2[0-3]):[0-5]\d$")
     snooze_minutes: int = Field(default=15, ge=5, le=120)
     reminders: list[ReminderItemInput] = Field(max_length=12)
+
+
+
+
+class AutomationPreferencesInput(BaseModel):
+    timezone_name: str = Field(default="Asia/Kolkata", min_length=1, max_length=80)
+    water_reminders_enabled: bool = True
+    water_interval_minutes: int = Field(default=90, ge=30, le=240)
+    morning_briefing_enabled: bool = True
+    morning_briefing_time: str = Field(default="07:00", pattern=r"^(?:[01]\d|2[0-3]):[0-5]\d$")
+    evening_checkin_enabled: bool = True
+    evening_checkin_time: str = Field(default="21:00", pattern=r"^(?:[01]\d|2[0-3]):[0-5]\d$")
 
 
 class ReminderActionInput(BaseModel):
@@ -751,14 +803,18 @@ DEFAULT_REMINDERS = [
 
 def get_or_create_reminder_preferences(user: User, db: Session) -> ReminderPreference:
     preferences = db.get(ReminderPreference, user.id)
+    created = preferences is None
     if preferences is None:
         preferences = ReminderPreference(user_id=user.id)
         db.add(preferences)
         db.flush()
-    existing = {item.meal for item in db.scalars(select(MealReminder).where(MealReminder.user_id == user.id))}
-    for meal, reminder_time in DEFAULT_REMINDERS:
-        if meal not in existing:
-            db.add(MealReminder(user_id=user.id, meal=meal, reminder_time=reminder_time))
+    # Seed defaults only on first creation. Re-adding deleted reminders on every
+    # read would silently undo a user's custom reminder list.
+    if created:
+        db.add_all(
+            MealReminder(user_id=user.id, meal=meal, reminder_time=reminder_time)
+            for meal, reminder_time in DEFAULT_REMINDERS
+        )
     db.flush()
     return preferences
 
@@ -1084,8 +1140,21 @@ def add_workout_set(session_id: int, payload: SetInput, user: WriteUser, db: Db)
     workout = db.scalar(select(WorkoutSession).where(WorkoutSession.id == session_id, WorkoutSession.user_id == user.id))
     if not workout or workout.completed_at:
         raise HTTPException(status_code=404, detail="Active workout not found.")
+    previous_best = db.scalar(select(func.max(WorkoutSet.weight_kg)).where(
+        WorkoutSet.user_id == user.id,
+        func.lower(WorkoutSet.exercise) == payload.exercise.strip().lower(),
+    ))
     row = WorkoutSet(session_id=session_id, user_id=user.id, **payload.model_dump())
     db.add(row)
+    db.flush()
+    if previous_best is not None and payload.weight_kg > previous_best and payload.reps > 0:
+        create_automation_event(
+            db, user.id, f"personal-record:{row.id}", "personal_record",
+            f"New load PR: {payload.exercise.strip()}",
+            f"You logged {payload.weight_kg:g} kg for {payload.exercise.strip()}, above your previous recorded best of {previous_best:g} kg.",
+            {"exercise": payload.exercise.strip(), "weight_kg": payload.weight_kg,
+             "previous_best_kg": previous_best, "reps": payload.reps, "session_id": session_id},
+        )
     db.commit()
     db.refresh(row)
     return {"id": row.id, "exercise": row.exercise, "set_number": row.set_number, "weight_kg": row.weight_kg, "reps": row.reps, "completed": row.completed}
@@ -1433,6 +1502,289 @@ def export_csv(user: CurrentUser, db: Db):
         ])
     output.seek(0)
     return StreamingResponse(iter([output.getvalue()]), media_type="text/csv", headers={"Content-Disposition": "attachment; filename=aura-progress.csv"})
+
+
+
+
+def get_or_create_automation_preferences(user_id: int, db: Session) -> AutomationPreference:
+    preferences = db.get(AutomationPreference, user_id)
+    if preferences is None:
+        preferences = AutomationPreference(user_id=user_id)
+        db.add(preferences)
+        db.flush()
+    return preferences
+
+
+def create_automation_event(
+    db: Session, user_id: int, event_key: str, kind: str, title: str, message: str,
+    metadata: dict | None = None,
+) -> bool:
+    existing = db.scalar(select(AutomationEvent.id).where(
+        AutomationEvent.user_id == user_id, AutomationEvent.event_key == event_key
+    ))
+    if existing:
+        return False
+    try:
+        with db.begin_nested():
+            db.add(AutomationEvent(
+                user_id=user_id, event_key=event_key, kind=kind, title=title, message=message,
+                metadata_json=json.dumps(metadata or {}),
+            ))
+            db.flush()
+        return True
+    except IntegrityError:
+        # A concurrent worker may have created this idempotency key; keep the
+        # caller's other pending changes intact by rolling back only the savepoint.
+        return False
+
+
+def automation_quiet_time(db: Session, user_id: int, local_now: datetime) -> bool:
+    prefs = db.get(ReminderPreference, user_id)
+    if not prefs or not prefs.quiet_start or not prefs.quiet_end:
+        return False
+    return is_quiet_time(local_now.time().replace(tzinfo=None), prefs.quiet_start, prefs.quiet_end)
+
+
+def build_daily_briefing(user_id: int, db: Session, local_day: date) -> dict:
+    start = datetime.combine(local_day, time.min)
+    end = start + timedelta(days=1)
+    foods = list(db.scalars(select(FoodEntry).where(
+        FoodEntry.user_id == user_id, FoodEntry.consumed_at >= start, FoodEntry.consumed_at < end
+    )))
+    calories = round(sum(x.calories * x.quantity for x in foods))
+    protein = round(sum(x.protein_g * x.quantity for x in foods), 1)
+    water = db.scalar(select(func.coalesce(func.sum(WaterEntry.amount_ml), 0)).where(
+        WaterEntry.user_id == user_id, WaterEntry.recorded_at >= start, WaterEntry.recorded_at < end
+    )) or 0
+    profile = db.get(UserProfile, user_id)
+    workouts = db.scalar(select(func.count(WorkoutSession.id)).where(
+        WorkoutSession.user_id == user_id,
+        WorkoutSession.completed_at >= start, WorkoutSession.completed_at < end,
+    )) or 0
+    habits_total = db.scalar(select(func.count(Habit.id)).where(
+        Habit.user_id == user_id, Habit.active.is_(True)
+    )) or 0
+    habits_done = db.scalar(select(func.count(HabitCompletion.id)).where(
+        HabitCompletion.user_id == user_id, HabitCompletion.completed_on == local_day
+    )) or 0
+    return {
+        "date": local_day.isoformat(), "food_entries": len(foods), "calories": calories,
+        "protein_g": protein, "water_ml": int(water),
+        "water_target_ml": profile.water_target_ml if profile else 2500,
+        "calorie_target": profile.calorie_target if profile else None,
+        "protein_target_g": profile.protein_target_g if profile else None,
+        "workouts_completed": int(workouts), "habits_done": int(habits_done),
+        "habits_total": int(habits_total),
+    }
+
+
+def evaluate_achievements(user_id: int, db: Session, local_day: date) -> list[dict]:
+    candidates: list[tuple[str, str, str, bool]] = []
+    food_count = db.scalar(select(func.count(FoodEntry.id)).where(FoodEntry.user_id == user_id)) or 0
+    workout_count = db.scalar(select(func.count(WorkoutSession.id)).where(
+        WorkoutSession.user_id == user_id, WorkoutSession.completed_at.is_not(None)
+    )) or 0
+    measurement_count = db.scalar(select(func.count(BodyMeasurement.id)).where(
+        BodyMeasurement.user_id == user_id
+    )) or 0
+    candidates.extend([
+        ("first_meal", "First meal logged", "You started your nutrition journal.", food_count >= 1),
+        ("first_workout", "First workout complete", "Your first completed workout is in the books.", workout_count >= 1),
+        ("first_measurement", "Progress tracked", "You recorded your first body measurement.", measurement_count >= 1),
+    ])
+    summary = build_daily_briefing(user_id, db, local_day)
+    candidates.append((
+        "water_goal_first_hit", "Hydration goal reached",
+        "You reached your daily water target on a logged day.",
+        summary["water_target_ml"] > 0 and summary["water_ml"] >= summary["water_target_ml"],
+    ))
+    active_habits = list(db.scalars(select(Habit.id).where(Habit.user_id == user_id, Habit.active.is_(True))))
+    if active_habits:
+        complete_streak = True
+        for offset in range(7):
+            check_day = local_day - timedelta(days=offset)
+            done = set(db.scalars(select(HabitCompletion.habit_id).where(
+                HabitCompletion.user_id == user_id,
+                HabitCompletion.completed_on == check_day,
+                HabitCompletion.habit_id.in_(active_habits),
+            )))
+            if not set(active_habits).issubset(done):
+                complete_streak = False
+                break
+        candidates.append((
+            "seven_day_habit_streak", "Seven-day habit streak",
+            "Every active habit was checked off for seven consecutive days.", complete_streak
+        ))
+    newly_earned = []
+    for code, title, description, qualified in candidates:
+        if not qualified or db.scalar(select(Achievement.id).where(
+            Achievement.user_id == user_id, Achievement.code == code
+        )):
+            continue
+        award = Achievement(user_id=user_id, code=code, title=title, description=description)
+        db.add(award)
+        db.flush()
+        create_automation_event(
+            db, user_id, f"achievement:{code}", "achievement", f"Achievement unlocked: {title}", description,
+            {"achievement_code": code},
+        )
+        newly_earned.append({"code": code, "title": title, "description": description})
+    return newly_earned
+
+
+def run_automations_for_user(user_id: int, db: Session, now: datetime | None = None) -> dict:
+    preferences = get_or_create_automation_preferences(user_id, db)
+    try:
+        zone = ZoneInfo(preferences.timezone_name)
+    except ZoneInfoNotFoundError:
+        zone = ZoneInfo("Asia/Kolkata")
+    now_utc = now or datetime.now(timezone.utc)
+    if now_utc.tzinfo is None:
+        now_utc = now_utc.replace(tzinfo=timezone.utc)
+    local_now = now_utc.astimezone(zone)
+    local_day = local_now.date()
+    created = 0
+    quiet = automation_quiet_time(db, user_id, local_now)
+
+    if preferences.morning_briefing_enabled and local_now.strftime("%H:%M") >= preferences.morning_briefing_time:
+        key = f"morning-briefing:{local_day.isoformat()}"
+        if not db.scalar(select(AutomationEvent.id).where(
+            AutomationEvent.user_id == user_id, AutomationEvent.event_key == key
+        )):
+            summary = build_daily_briefing(user_id, db, local_day)
+            msg = (
+                f"Today's starting point: {summary['calories']} kcal and {summary['protein_g']} g protein "
+                f"logged, {summary['water_ml']} ml water, {summary['habits_done']}/{summary['habits_total']} habits "
+                "completed so far. These numbers reflect logged data only."
+            )
+            created += int(create_automation_event(
+                db, user_id, key, "briefing", "Your AURA morning briefing", msg, summary
+            ))
+
+    if preferences.evening_checkin_enabled and local_now.strftime("%H:%M") >= preferences.evening_checkin_time:
+        key = f"evening-checkin:{local_day.isoformat()}"
+        if not db.scalar(select(AutomationEvent.id).where(
+            AutomationEvent.user_id == user_id, AutomationEvent.event_key == key
+        )):
+            summary = build_daily_briefing(user_id, db, local_day)
+            msg = (
+                f"Your day so far: {summary['calories']} kcal, {summary['protein_g']} g protein, "
+                f"{summary['water_ml']} ml water, {summary['workouts_completed']} completed workouts, "
+                f"and {summary['habits_done']}/{summary['habits_total']} habits checked off. "
+                "Only recorded activity is included—unlogged activity is unknown."
+            )
+            created += int(create_automation_event(
+                db, user_id, key, "checkin", "Your AURA evening check-in", msg, summary
+            ))
+
+    if preferences.water_reminders_enabled and not quiet and time(7, 0) <= local_now.time().replace(tzinfo=None) < time(22, 0):
+        local_start = datetime.combine(local_day, time.min)
+        water_rows = list(db.scalars(select(WaterEntry.recorded_at).where(
+            WaterEntry.user_id == user_id, WaterEntry.recorded_at >= local_start
+        ).order_by(WaterEntry.recorded_at.desc()).limit(1)))
+        last_water = water_rows[0] if water_rows else None
+        now_naive = local_now.replace(tzinfo=None)
+        elapsed = (now_naive - last_water).total_seconds() / 60 if last_water else (
+            now_naive - datetime.combine(local_day, time(7, 0))
+        ).total_seconds() / 60
+        if elapsed >= preferences.water_interval_minutes:
+            slot = int((local_now.hour * 60 + local_now.minute - 7 * 60) // preferences.water_interval_minutes)
+            slot_start = datetime.combine(local_day, time(7, 0)) + timedelta(minutes=slot * preferences.water_interval_minutes)
+            # If water was logged after this reminder slot began, do not notify for this slot.
+            if not last_water or last_water < slot_start:
+                key = f"water:{local_day.isoformat()}:{slot}"
+                created += int(create_automation_event(
+                    db, user_id, key, "hydration", "A gentle hydration check-in",
+                    "If you have had water recently, you can ignore this. Otherwise, consider logging a glass of water.",
+                    {"interval_minutes": preferences.water_interval_minutes},
+                ))
+
+    created_achievements = evaluate_achievements(user_id, db, local_day)
+    db.commit()
+    return {"created_events": created, "new_achievements": created_achievements, "checked_at": local_now.isoformat()}
+
+
+@app.get("/api/automations/settings")
+def get_automation_settings(user: CurrentUser, db: Db):
+    p = get_or_create_automation_preferences(user.id, db)
+    db.commit()
+    return {
+        "timezone_name": p.timezone_name,
+        "water_reminders_enabled": p.water_reminders_enabled,
+        "water_interval_minutes": p.water_interval_minutes,
+        "morning_briefing_enabled": p.morning_briefing_enabled,
+        "morning_briefing_time": p.morning_briefing_time,
+        "evening_checkin_enabled": p.evening_checkin_enabled,
+        "evening_checkin_time": p.evening_checkin_time,
+    }
+
+
+@app.put("/api/automations/settings")
+def save_automation_settings(payload: AutomationPreferencesInput, user: WriteUser, db: Db):
+    try:
+        ZoneInfo(payload.timezone_name)
+    except ZoneInfoNotFoundError as exc:
+        raise HTTPException(status_code=422, detail="Use a valid IANA time zone, such as Asia/Kolkata.") from exc
+    p = get_or_create_automation_preferences(user.id, db)
+    for key, value in payload.model_dump().items():
+        setattr(p, key, value)
+    p.updated_at = utc_now()
+    db.commit()
+    return get_automation_settings(user, db)
+
+
+@app.post("/api/automations/run-now")
+def run_automations_now(user: WriteUser, db: Db):
+    return run_automations_for_user(user.id, db)
+
+
+@app.get("/api/automations/overview")
+def automation_overview(user: CurrentUser, db: Db):
+    p = get_or_create_automation_preferences(user.id, db)
+    db.flush()
+    zone = ZoneInfo(p.timezone_name)
+    local_now = datetime.now(timezone.utc).astimezone(zone)
+    summary = build_daily_briefing(user.id, db, local_now.date())
+    suggestions = []
+    if summary["food_entries"] == 0:
+        suggestions.append({"title": "Nutrition log is empty", "detail": "If you have eaten, log a meal to make today's nutrition summary more complete."})
+    if summary["water_ml"] < summary["water_target_ml"]:
+        suggestions.append({"title": "Hydration progress", "detail": f"{summary['water_ml']} of {summary['water_target_ml']} ml logged today. Log water you have actually had; estimates are not added automatically."})
+    if summary["habits_total"] and summary["habits_done"] < summary["habits_total"]:
+        suggestions.append({"title": "Habit check-in", "detail": f"{summary['habits_done']} of {summary['habits_total']} active habits are marked complete today."})
+    if summary["calorie_target"] and summary["calories"] < summary["calorie_target"] and summary["food_entries"]:
+        suggestions.append({"title": "Nutrition target", "detail": f"{summary['calories']} of {summary['calorie_target']} kcal logged so far. This reflects entries only, not necessarily everything you ate."})
+    events = list(db.scalars(select(AutomationEvent).where(
+        AutomationEvent.user_id == user.id
+    ).order_by(AutomationEvent.created_at.desc()).limit(20)))
+    achievements = list(db.scalars(select(Achievement).where(
+        Achievement.user_id == user.id
+    ).order_by(Achievement.earned_at.desc()).limit(30)))
+    return {
+        "today": summary,
+        "suggestions": suggestions,
+        "events": [{
+            "id": e.id, "kind": e.kind, "title": e.title, "message": e.message,
+            "created_at": e.created_at.isoformat(), "read": e.read_at is not None,
+            "metadata": json.loads(e.metadata_json or "{}"),
+        } for e in events],
+        "achievements": [{
+            "id": a.id, "code": a.code, "title": a.title, "description": a.description,
+            "earned_at": a.earned_at.isoformat(),
+        } for a in achievements],
+    }
+
+
+@app.post("/api/automations/events/{event_id}/read")
+def mark_automation_event_read(event_id: int, user: WriteUser, db: Db):
+    event_row = db.scalar(select(AutomationEvent).where(
+        AutomationEvent.id == event_id, AutomationEvent.user_id == user.id
+    ))
+    if not event_row:
+        raise HTTPException(status_code=404, detail="Automation event not found.")
+    event_row.read_at = utc_now()
+    db.commit()
+    return {"id": event_row.id, "read": True}
 
 
 @app.delete("/api/account", status_code=204)

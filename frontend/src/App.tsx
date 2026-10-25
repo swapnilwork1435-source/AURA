@@ -16,7 +16,7 @@ type Routine = { id: number; name: string; routine_time: string; steps: string[]
 type Reminder = { id: number; meal: string; local_date: string; status: string; snooze_minutes: number };
 type ParsedMeal = { food_id: number; food_name: string; quantity: number; serving_unit: string; calories: number; protein_g: number; carbs_g: number; fat_g: number; assumption: string; estimated: boolean };
 type AssistantResult = { kind: string; text: string; parsed?: { items: ParsedMeal[]; totals?: { calories: number; protein_g: number; carbs_g: number; fat_g: number }; clarification?: string } };
-type Page = "Dashboard" | "Nutrition" | "Workouts" | "Body Progress" | "Looksmaxing" | "Daily Habits" | "Sleep & Recovery" | "Analytics" | "Profile" | "Settings";
+type Page = "Dashboard" | "Nutrition" | "Workouts" | "Body Progress" | "Looksmaxing" | "Daily Habits" | "Sleep & Recovery" | "Analytics" | "Automation" | "Profile" | "Settings";
 
 function csrfToken() {
   return document.cookie.split("; ").find((part) => part.startsWith("aura_csrf="))?.split("=").slice(1).join("=") ?? "";
@@ -52,7 +52,7 @@ const displayDate = (date: Date) => date.toLocaleDateString("en-US", { weekday: 
 const navItems: { name: Page; icon: typeof Home }[] = [
   { name: "Dashboard", icon: Home }, { name: "Nutrition", icon: Utensils }, { name: "Workouts", icon: Dumbbell },
   { name: "Body Progress", icon: Weight }, { name: "Looksmaxing", icon: Sparkles }, { name: "Daily Habits", icon: ClipboardList },
-  { name: "Sleep & Recovery", icon: Moon }, { name: "Analytics", icon: BarChart3 },
+  { name: "Sleep & Recovery", icon: Moon }, { name: "Analytics", icon: BarChart3 }, { name: "Automation", icon: Bell },
 ];
 function Button({ children, onClick, variant = "primary", type = "button", disabled = false }: { children: React.ReactNode; onClick?: () => void; variant?: "primary" | "secondary" | "quiet" | "danger"; type?: "button" | "submit"; disabled?: boolean }) {
   return <button className={`button ${variant}`} onClick={onClick} type={type} disabled={disabled}>{children}</button>;
@@ -370,6 +370,8 @@ export default function App() {
           <Panel title="Water check-in"><p className="muted">You have logged <b>{dash?.water_ml ?? 0} ml</b> of your {dash?.water_target_ml ?? 2500} ml daily water goal.</p><div className="water-actions">{[150, 250, 500].map((ml) => <Button key={ml} variant="secondary" onClick={() => run(() => api("/water", { method: "POST", body: JSON.stringify({ amount_ml: ml }) }), `${ml} ml water added`)}><Droplets size={15} /> +{ml} ml</Button>)}</div></Panel>
         </section>}
 
+        {page === "Automation" && <AutomationCenter onError={setError} onNotice={setNotice} />}
+
         {page === "Analytics" && <section><PageHeading eyebrow="YOUR DATA, YOUR STORY" title="Progress insights" description="Export your logged measurements and nutrition for a closer look." action={<button className="button primary link-button" onClick={async () => { try { const response = await fetch(`${API}/analytics/export`, { credentials: "include" }); if (!response.ok) throw new Error("Could not export your data."); const blob = await response.blob(); const url = URL.createObjectURL(blob); const a = document.createElement("a"); a.href = url; a.download = "aura-progress.csv"; a.click(); URL.revokeObjectURL(url); } catch (e) { setError(e instanceof Error ? e.message : "Could not export your data."); } }}><ArrowDownRight size={16} /> Export CSV</button>} />
           <div className="analytics-grid"><Panel title="Weight history">{measurements.some((m) => m.weight_kg) ? <div className="chart-wrap"><ResponsiveContainer width="100%" height={235}><AreaChart data={[...measurements].reverse().filter((m) => m.weight_kg).map((m) => ({ date: m.measured_on.slice(5), weight: m.weight_kg }))}><CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#292d28" /><XAxis dataKey="date" tickLine={false} axisLine={false} tick={{ fill: "#747b70", fontSize: 11 }} /><YAxis domain={["auto", "auto"]} tickLine={false} axisLine={false} tick={{ fill: "#747b70", fontSize: 11 }} /><Tooltip contentStyle={{ background: "#1a1d19", border: "1px solid #343a31", borderRadius: 12 }} /><Area dataKey="weight" type="monotone" stroke="#b9db83" fill="#b9db8325" /></AreaChart></ResponsiveContainer></div> : <Empty icon={<TrendingUp size={18} />} title="Waiting for your first data point" detail="Your charts update when you log progress." />}</Panel><Panel title="Daily nutrition"><div className="insight-number">{dash?.calories ?? 0}<small> kcal today</small></div><p className="muted">Protein {dash?.protein_g ?? 0} g · Carbs {dash?.carbs_g ?? 0} g · Fat {dash?.fat_g ?? 0} g</p><Button variant="secondary" onClick={() => setPage("Nutrition")}>Open nutrition journal <ArrowUpRight size={15} /></Button></Panel></div>
           <WeeklyReport />
@@ -567,4 +569,125 @@ function ReminderSettings({ onError, onSaved }: { onError: (message: string) => 
       <div className="form-actions"><Button type="submit" disabled={busy}>{busy ? "Saving…" : "Save reminder settings"}</Button></div>
     </form>
   </Panel>;
+}
+
+
+type AutomationSettings = {
+  timezone_name: string;
+  water_reminders_enabled: boolean;
+  water_interval_minutes: number;
+  morning_briefing_enabled: boolean;
+  morning_briefing_time: string;
+  evening_checkin_enabled: boolean;
+  evening_checkin_time: string;
+};
+type AutomationEventItem = {
+  id: number; kind: string; title: string; message: string; created_at: string; read: boolean;
+};
+type AutomationAchievement = { id: number; code: string; title: string; description: string; earned_at: string };
+type AutomationOverview = {
+  today: { calories: number; protein_g: number; water_ml: number; water_target_ml: number; food_entries: number; habits_done: number; habits_total: number; workouts_completed: number };
+  suggestions: { title: string; detail: string }[];
+  events: AutomationEventItem[];
+  achievements: AutomationAchievement[];
+};
+
+function AutomationCenter({ onError, onNotice }: { onError: (message: string) => void; onNotice: (message: string) => void }) {
+  const [settings, setSettings] = useState<AutomationSettings>({
+    timezone_name: "Asia/Kolkata", water_reminders_enabled: true, water_interval_minutes: 90,
+    morning_briefing_enabled: true, morning_briefing_time: "07:00",
+    evening_checkin_enabled: true, evening_checkin_time: "21:00",
+  });
+  const [overview, setOverview] = useState<AutomationOverview | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [loading, setLoading] = useState(true);
+
+  const reload = useCallback(async () => {
+    try {
+      const [saved, data] = await Promise.all([
+        api<AutomationSettings>("/automations/settings"),
+        api<AutomationOverview>("/automations/overview"),
+      ]);
+      setSettings(saved);
+      setOverview(data);
+    } catch (error) {
+      onError(error instanceof Error ? error.message : "Could not load automation settings.");
+    } finally {
+      setLoading(false);
+    }
+  }, [onError]);
+
+  useEffect(() => { void reload(); }, [reload]);
+
+  const save = async (event: FormEvent) => {
+    event.preventDefault();
+    setBusy(true);
+    try {
+      const saved = await api<AutomationSettings>("/automations/settings", { method: "PUT", body: JSON.stringify(settings) });
+      setSettings(saved);
+      onNotice("Automation preferences saved");
+      await reload();
+    } catch (error) {
+      onError(error instanceof Error ? error.message : "Could not save automation preferences.");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const runNow = async () => {
+    setBusy(true);
+    try {
+      const result = await api<{ created_events: number; new_achievements: { title: string }[] }>("/automations/run-now", { method: "POST", body: "{}" });
+      onNotice(`Automation check complete · ${result.created_events} new event(s), ${result.new_achievements.length} achievement(s)`);
+      await reload();
+    } catch (error) {
+      onError(error instanceof Error ? error.message : "Automation check failed.");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const markRead = async (id: number) => {
+    try {
+      await api(`/automations/events/${id}/read`, { method: "POST", body: "{}" });
+      await reload();
+    } catch (error) {
+      onError(error instanceof Error ? error.message : "Could not mark event as read.");
+    }
+  };
+
+  return <section>
+    <PageHeading eyebrow="YOUR PERSONAL AUTOMATION ENGINE" title="AURA automations" description="Helpful check-ins built from your saved data, with controls you can change any time." action={<Button onClick={runNow} disabled={busy}><Activity size={16} /> {busy ? "Checking…" : "Run checks now"}</Button>} />
+    <div className="metrics-grid">
+      <Metric icon={<Flame size={17} />} title="Logged calories" value={overview?.today.calories ?? 0} unit="kcal" color="orange" note={`${overview?.today.food_entries ?? 0} food entries`} />
+      <Metric icon={<Heart size={17} />} title="Protein logged" value={overview?.today.protein_g ?? 0} unit="g" color="lime" note="Recorded entries only" />
+      <Metric icon={<Droplets size={17} />} title="Water logged" value={overview?.today.water_ml ?? 0} unit="ml" color="blue" target={overview?.today.water_target_ml} note={`Target ${overview?.today.water_target_ml ?? 2500} ml`} />
+      <Metric icon={<Check size={17} />} title="Habits checked" value={`${overview?.today.habits_done ?? 0}/${overview?.today.habits_total ?? 0}`} unit="" color="violet" note={`${overview?.today.workouts_completed ?? 0} completed workouts today`} />
+    </div>
+    <Panel title="Automation schedule">
+      <p className="muted">These settings control when AURA creates persistent reminders and daily summaries. For automatic scheduling while the browser is closed, run the local automation worker described in the README.</p>
+      <form className="form-grid automation-form" onSubmit={save}>
+        <Field label="Time zone (IANA)" value={settings.timezone_name} onChange={(event) => setSettings({ ...settings, timezone_name: event.target.value })} placeholder="Asia/Kolkata" required />
+        <SelectField label="Hydration interval" value={settings.water_interval_minutes} onChange={(event) => setSettings({ ...settings, water_interval_minutes: Number(event.target.value) })}>{[30, 45, 60, 90, 120, 180, 240].map((n) => <option key={n} value={n}>{n} minutes</option>)}</SelectField>
+        <label className="automation-toggle"><input type="checkbox" checked={settings.water_reminders_enabled} onChange={(event) => setSettings({ ...settings, water_reminders_enabled: event.target.checked })} /> Hydration check-ins</label>
+        <label className="automation-toggle"><input type="checkbox" checked={settings.morning_briefing_enabled} onChange={(event) => setSettings({ ...settings, morning_briefing_enabled: event.target.checked })} /> Morning briefing</label>
+        <Field label="Morning briefing time" type="time" value={settings.morning_briefing_time} onChange={(event) => setSettings({ ...settings, morning_briefing_time: event.target.value })} />
+        <label className="automation-toggle"><input type="checkbox" checked={settings.evening_checkin_enabled} onChange={(event) => setSettings({ ...settings, evening_checkin_enabled: event.target.checked })} /> Evening check-in</label>
+        <Field label="Evening check-in time" type="time" value={settings.evening_checkin_time} onChange={(event) => setSettings({ ...settings, evening_checkin_time: event.target.value })} />
+        <div className="form-actions"><Button type="submit" disabled={busy}>{busy ? "Saving…" : "Save automations"}</Button></div>
+      </form>
+    </Panel>
+    <div className="analytics-grid">
+      <Panel title="Suggestions from your data">
+        {overview?.suggestions.length ? <div className="automation-list">{overview.suggestions.map((item) => <article className="automation-item" key={item.title}><b>{item.title}</b><p>{item.detail}</p></article>)}</div> : <p className="muted">No suggestions right now. AURA only uses information you have recorded.</p>}
+      </Panel>
+      <Panel title="Achievements">
+        {overview?.achievements.length ? <div className="automation-list">{overview.achievements.map((item) => <article className="automation-item achievement-item" key={item.code}><span className="automation-badge"><Sparkles size={16} /></span><div><b>{item.title}</b><p>{item.description}</p><small>{new Date(item.earned_at).toLocaleDateString()}</small></div></article>)}</div> : <p className="muted">Your milestones will appear here as you use AURA. No progress is awarded without matching saved records.</p>}
+      </Panel>
+    </div>
+    <Panel title="Recent automation events" action={<span className="tiny-label">{overview?.events.filter((item) => !item.read).length ?? 0} UNREAD</span>}>
+      {loading ? <p className="muted">Loading automation data…</p> : overview?.events.length ? <div className="automation-list">{overview.events.map((item) => <article className={`automation-item automation-event ${item.read ? "read" : ""}`} key={item.id}><div><span className="tiny-label">{item.kind.replaceAll("_", " ").toUpperCase()} · {new Date(item.created_at).toLocaleString()}</span><b>{item.title}</b><p>{item.message}</p></div>{!item.read && <Button variant="quiet" onClick={() => markRead(item.id)}>Mark read</Button>}</article>)}</div> : <p className="muted">No automation events yet. Run a check or start the local worker to create scheduled events.</p>}
+    </Panel>
+    <div className="privacy-note"><ShieldCheck size={17} /><div><b>Designed for careful tracking</b><p>Suggestions use recorded data only. AURA does not assume an unlogged meal was skipped, and automations never silently change your nutrition targets.</p></div></div>
+  </section>;
 }
