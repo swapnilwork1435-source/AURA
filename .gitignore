@@ -1,0 +1,11 @@
+__pycache__/
+*.py[cod]
+*.tsbuildinfo
+.venv/
+venv/
+node_modules/
+dist/
+.env
+backend/app/data/
+backend/data/
+.pytest_cache/
